@@ -1,132 +1,134 @@
 #!/usr/bin/env node
-var cluster = require('cluster');
-var path = require('path');
-var fs = require('fs');
-var zlib = require('zlib');
-var argv = require('minimist')(process.argv.slice(2));
-var opentype = require('opentype.js');
-var Protobuf = require('pbf');
-var sdf = require('../lib/sdf').glyphToSDF;
 
+const assert = require('assert');
+const fs = require('fs');
+const program = require('commander');
+const opentype = require('opentype.js');
+const sdf = require('../lib/sdf').glyphToSDF;
+const potpack = require('potpack');
+const pkg = require('../package.json');
 
-function usage() {
-    console.warn('Usage: %s [args] [font file]...', path.relative(process.cwd(), process.argv[1]));
-    console.warn('  --min [chr]\t Minimum char code to generate');
-    console.warn('  --max [chr]\t Minimum char code to generate');
-    console.warn('  --workers [count]\t Number of concurrent worders');
-    process.exit(1);
-}
+program
+    .version(pkg.version)
+    .usage('[options] <font.ttf>')
+    .option('--min [min]', 'Minimum char code to generate', 0x20)
+    .option('--max [max]', 'Maximum char code to generate inclusive', 0x21F)
+    .parse(process.argv);
 
 var fontSize = 24;
 var buffer = 3;
-var cutoff = 2/8;
+var cutoff = 2 / 8;
 
-var minchr = +(argv.min || 0);
-var maxchr = +(argv.max || 65535);
-var workers = +(argv.workers || require('os').cpus().length);
-
-var from = minchr - minchr % 256;
-
-var fonts = argv._;
+var fonts = program.args;
 if (!fonts.length) {
-    usage();
+    program.outputHelp();
+    process.exit(1);
 }
 
-if (cluster.isMaster) {
-    // Fork workers.
-    for (var i = 0; i < workers; i++) {
-        cluster.fork().on('message', function(msg) {
-            if (msg.type === 'work') {
-                if (from < maxchr) {
-                    this.send({ type: 'chunk', from: from });
-                    from += 256;
-                } else {
-                    this.send({ type: 'exit' });
-                }
-            }
-        });
-    }
-} else {
-    fonts = fonts.map(function(filename) {
-        var data = fs.readFileSync(filename);
-        var font = opentype.parse(new Uint8Array(data).buffer);
-        font.filename = filename;
-        return font;
-    }).filter(function(font) {
-        if (!font.supported) {
-            console.warn(font.filename + ' is not supported.');
-            return false;
-        } else {
-            return true;
-        }
-    });
-
-    var basename = fonts.map(function(font) {
-        return (font.tables.name.preferredFamily || font.tables.name.fontFamily) + ' ' +
-               (font.tables.name.preferredSubfamily || font.tables.name.fontSubfamily);
-    }).join(', ');
-
-    try {
-        fs.mkdirSync(basename);
-    } catch(err) {
-        if (err.code != 'EEXIST') {
-            throw err;
-        }
-    }
-    process.on('message', function(msg) {
-        if (msg.type === 'chunk') {
-            createGlyphs(msg.from, msg.from + 255, function() {
-                process.send({ type: 'work' });
-            });
-        } else if (msg.type === 'exit') {
-            process.exit(0);
-        }
-    });
-
-    // Request the initial work package.
-    process.send({ type: 'work' });
+var font = opentype.loadSync(fonts[0]);
+if (!font.supported) {
+    console.warn(fonts[0] + ' is not supported.');
+    process.exit(1);
 }
 
+createGlyphs(+program.min, +program.max);
 
-function createGlyphs(from, to, callback) {
-    var out = path.join(basename, from + '-' + to + '.pbf');
-    console.warn('Generating ' + out);
+function copyData(srcImg, dstImg, srcPt, dstPt, size, channels) {
+    if (size.width === 0 || size.height === 0) {
+        return dstImg;
+    }
 
-    var fontstack_pbf = new Protobuf(new Buffer(16384));
-    fontstack_pbf.writeTaggedString(/* name */ 1, basename);
-    fontstack_pbf.writeTaggedString(/* range */ 2, from + '-' + to);
+    if (size.width > srcImg.width ||
+        size.height > srcImg.height ||
+        srcPt.x > srcImg.width - size.width ||
+        srcPt.y > srcImg.height - size.height) {
+        throw new RangeError('out of range source coordinates for image copy');
+    }
 
+    if (size.width > dstImg.width ||
+        size.height > dstImg.height ||
+        dstPt.x > dstImg.width - size.width ||
+        dstPt.y > dstImg.height - size.height) {
+        throw new RangeError('out of range destination coordinates for image copy');
+    }
+
+    const srcData = srcImg.data;
+    const dstData = dstImg.data;
+
+    assert(srcData !== dstData);
+
+    for (let y = 0; y < size.height; y++) {
+        const srcOffset = ((srcPt.y + y) * srcImg.width + srcPt.x) * channels;
+        const dstOffset = ((dstPt.y + y) * dstImg.width + dstPt.x) * channels;
+        for (let i = 0; i < size.width * channels; i++) {
+            dstData[dstOffset + i] = srcData[srcOffset + i];
+        }
+    }
+
+    return dstImg;
+}
+
+function createGlyphs(from, to) {
+    console.warn(`Generating glyphs range ${from}-${to}`);
+
+    const padding = 1.0;
+
+    const json = {
+        size: fontSize,
+        width: 0,
+        height: 0,
+        glyphs: {}
+    };
+    const positions = [];
+    const bins = [];
     for (var chr = from; chr <= to; chr++) {
-        for (var i = 0; i < fonts.length; i++) {
-            var font = fonts[i];
-            var glyph = font.charToGlyph(String.fromCharCode(chr));
-            if (glyph.index > 0) {
-                var info = sdf(glyph, fontSize, buffer, cutoff);
-                var glyph_pbf = new Protobuf(new Buffer(512));
-                glyph_pbf.writeTaggedVarint(/* id */ 1, chr);
-                if (info.data) {
-                    glyph_pbf.writeTaggedBuffer(/* bitmap */ 2, new Buffer(info.data));
-                }
-                glyph_pbf.writeTaggedVarint(/* width */ 3, info.glyphWidth);
-                glyph_pbf.writeTaggedVarint(/* height */ 4, info.glyphHeight);
-                glyph_pbf.writeTaggedSVarint(/* left */ 5, info.glyphBearingX);
-                glyph_pbf.writeTaggedSVarint(/* top */ 6, info.glyphTop);
-                glyph_pbf.writeTaggedVarint(/* advance */ 7, info.glyphAdvance);
-
-                fontstack_pbf.writeMessage(/* glyphs */ 3, glyph_pbf);
-                break;
+        var glyph = font.charToGlyph(String.fromCharCode(chr));
+        if (glyph.index > 0) {
+            var info = sdf(font, glyph, fontSize, buffer, cutoff);
+            let bin;
+            if (info.data && info.width && info.height) {
+                bin = {
+                    x: 0,
+                    y: 0,
+                    w: (info.glyphWidth + 2 * buffer) + 2 * padding,
+                    h: (info.glyphHeight + 2 * buffer) + 2 * padding
+                };
+                bins.push(bin);
             }
+
+            positions.push({
+                char: chr,
+                rect: bin,
+                left: info.glyphBearingX,
+                top: info.glyphTop,
+                advance: info.glyphAdvance,
+                data: info.data
+            });
         }
     }
 
-    var glyphs_pbf = new Protobuf(new Buffer(fontstack_pbf.pos + 8));
-    glyphs_pbf.writeMessage(/* stacks */ 1, fontstack_pbf);
+    const { w, h } = potpack(bins);
+    json.width = w;
+    json.height = h;
 
-    zlib.deflate(glyphs_pbf.finish(), function(err, data) {
-        if (err) console.warn(err.stack);
-        fs.writeFile(out, data, function(err) {
-            if (err) console.warn(err.stack);
-            callback();
-        });
-    });
+    const binaryData = new Uint8Array(w * h);
+    for (const pos of positions) {
+        const rect = pos.rect;
+        json.glyphs[pos.char] = {
+            rect,
+            left: pos.left,
+            top: pos.top,
+            advance: pos.advance
+        }
+
+        if (pos.data) {
+            const srcImg = { width: rect.w - 2 * padding, height: rect.h - 2 * padding, data: pos.data };
+            const dstImg = { width: w, height: h, data: binaryData };
+            copyData(srcImg, dstImg, {x: 0, y: 0}, {x: rect.x + padding, y: rect.y + padding}, srcImg, 1);
+        }
+    }
+
+    let data = JSON.stringify(json, null);
+    fs.writeFileSync('open-sans.json', data);
+    fs.writeFileSync('open-sans.sdf',new Buffer(binaryData));
 }
